@@ -2,7 +2,7 @@ import asyncio
 import logging
 import numpy as np
 
-# Create one event loop for Pyrogram and PyTgCalls.
+# Use one event loop for the application.
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
@@ -33,7 +33,7 @@ logger = logging.getLogger("TelegramFightVC")
 SUDO_USERS = {OWNER_ID}
 
 
-# ================= INITIALIZE CLIENTS =================
+# ================= PYROGRAM CLIENT =================
 app = Client(
     "tg_fight_userbot",
     api_id=API_ID,
@@ -44,7 +44,7 @@ app = Client(
 call_py = PyTgCalls(app)
 
 
-# ================= ACTIVE VC VARIABLES =================
+# ================= BRIDGE STATE =================
 current_logger_chat = None
 current_target_chat = None
 current_volume = 100
@@ -75,7 +75,7 @@ def is_authorized(_, __, message: Message):
 sudo_filter = filters.create(is_authorized)
 
 
-# ================= AUDIO RELAY =================
+# ================= AUDIO BRIDGE =================
 @call_py.on_update(
     call_filters.stream_frame(
         Direction.INCOMING,
@@ -87,27 +87,32 @@ async def relay_audio(_, update: StreamFrames):
     global current_target_chat
     global current_volume
 
-    if current_logger_chat is None or current_target_chat is None:
+    logger_chat = current_logger_chat
+    target_chat = current_target_chat
+
+    if logger_chat is None or target_chat is None:
         return
 
-    if update.chat_id != current_logger_chat:
+    # Only forward audio originating in the logger group.
+    if update.chat_id != logger_chat:
         return
 
     if not update.frames:
         return
 
     try:
-        sample_arrays = [
-            np.frombuffer(item.frame, dtype=np.int16)
-            for item in update.frames
-            if item.frame
+        frame_arrays = [
+            np.frombuffer(frame.frame, dtype=np.int16)
+            for frame in update.frames
+            if frame.frame
         ]
 
-        if not sample_arrays:
+        if not frame_arrays:
             return
 
-        audio = np.concatenate(sample_arrays)
+        audio = np.concatenate(frame_arrays)
 
+        # Apply gain and prevent integer overflow.
         gain = current_volume / 100.0
 
         audio = np.clip(
@@ -117,16 +122,16 @@ async def relay_audio(_, update: StreamFrames):
         ).astype(np.int16)
 
         await call_py.send_frame(
-            current_target_chat,
+            target_chat,
             Device.MICROPHONE,
             audio.tobytes(),
         )
 
     except Exception:
-        logger.exception("Audio relay failed")
+        logger.exception("Audio forwarding failed")
 
 
-# ================= COMMAND: .HELP =================
+# ================= .HELP =================
 @app.on_message(
     filters.command("help", prefixes=".") & sudo_filter
 )
@@ -134,16 +139,16 @@ async def help_command(client: Client, message: Message):
     await message.reply(
         "🔥 **Telegram Fight Voice Chat Bot** 🔥\n\n"
         "• `.help` - Show help.\n"
-        "• `.joinvc <logger_id> <target_id>` - Start audio bridge.\n"
-        "• `.leavevc` - Stop the bridge.\n"
+        "• `.joinvc <logger_id> <target_id>` - Start bridge.\n"
+        "• `.leavevc` - Stop bridge.\n"
         "• `.volume <1-500>` - Set audio gain.\n"
-        "• `.addsudo <user_id>` - Add sudo (owner only).\n"
-        "• `.rmsudo <user_id>` - Remove sudo (owner only).\n"
+        "• `.addsudo <user_id>` - Add sudo user.\n"
+        "• `.rmsudo <user_id>` - Remove sudo user.\n"
         "• `.sudolist` - Show sudo users."
     )
 
 
-# ================= COMMAND: .ADDSUDO =================
+# ================= .ADDSUDO =================
 @app.on_message(
     filters.command("addsudo", prefixes=".") & filters.user(OWNER_ID)
 )
@@ -163,16 +168,14 @@ async def add_sudo(client: Client, message: Message):
         )
 
     except ValueError:
-        await message.reply(
-            "❌ Enter a valid numeric user ID."
-        )
+        await message.reply("❌ Enter a valid numeric user ID.")
 
     except Exception as e:
-        logger.exception("Add sudo error")
+        logger.exception("Add sudo failed")
         await message.reply(f"❌ Error: {e}")
 
 
-# ================= COMMAND: .RMSUDO =================
+# ================= .RMSUDO =================
 @app.on_message(
     filters.command("rmsudo", prefixes=".") & filters.user(OWNER_ID)
 )
@@ -187,15 +190,11 @@ async def remove_sudo(client: Client, message: Message):
         user_id = int(args[1])
 
         if user_id == OWNER_ID:
-            await message.reply(
-                "❌ You cannot remove the owner."
-            )
+            await message.reply("❌ You cannot remove the owner.")
             return
 
         if user_id not in SUDO_USERS:
-            await message.reply(
-                "⚠️ This user is not in the sudo list."
-            )
+            await message.reply("⚠️ User is not in the sudo list.")
             return
 
         SUDO_USERS.remove(user_id)
@@ -205,22 +204,20 @@ async def remove_sudo(client: Client, message: Message):
         )
 
     except ValueError:
-        await message.reply(
-            "❌ Enter a valid numeric user ID."
-        )
+        await message.reply("❌ Enter a valid numeric user ID.")
 
     except Exception as e:
-        logger.exception("Remove sudo error")
+        logger.exception("Remove sudo failed")
         await message.reply(f"❌ Error: {e}")
 
 
-# ================= COMMAND: .SUDOLIST =================
+# ================= .SUDOLIST =================
 @app.on_message(
     filters.command("sudolist", prefixes=".") & sudo_filter
 )
 async def sudo_list(client: Client, message: Message):
     users = "\n".join(
-        f"• `{uid}`" for uid in sorted(SUDO_USERS)
+        f"• `{user_id}`" for user_id in sorted(SUDO_USERS)
     )
 
     await message.reply(
@@ -229,7 +226,7 @@ async def sudo_list(client: Client, message: Message):
     )
 
 
-# ================= COMMAND: .JOINVC =================
+# ================= .JOINVC =================
 @app.on_message(
     filters.command("joinvc", prefixes=".") & sudo_filter
 )
@@ -251,88 +248,84 @@ async def join_vc(client: Client, message: Message):
 
         if logger_chat == target_chat:
             await message.reply(
-                "❌ Logger and target groups must be different."
+                "❌ Logger and target must be different groups."
             )
             return
 
-        async with bridge_lock:
-            if current_logger_chat is not None:
-                await message.reply(
-                    "⚠️ A bridge is already active. "
-                    "Use `.leavevc` first."
-                )
-                return
+    except ValueError:
+        await message.reply(
+            "❌ Both group IDs must be numeric."
+        )
+        return
 
+    async with bridge_lock:
+        if current_logger_chat is not None:
             await message.reply(
-                "🔄 Connecting to both voice chats and setting up audio..."
+                "⚠️ Bridge is already active. Use `.leavevc` first."
             )
+            return
 
-            try:
-                # Set up outgoing audio in the target group.
+        await message.reply(
+            "🔄 Connecting to logger and target voice chats..."
+        )
+
+        try:
+            # Prepare the outgoing audio stream in both groups.
+            for chat_id in (logger_chat, target_chat):
                 await call_py.play(
-                    target_chat,
+                    chat_id,
                     MediaStream(
                         ExternalMedia.AUDIO,
                         AUDIO_PARAMETERS,
                     ),
                 )
 
-                # Set up recording in the logger group.
+            # Capture incoming audio frames in both groups.
+            for chat_id in (logger_chat, target_chat):
                 await call_py.record(
-                    logger_chat,
+                    chat_id,
                     RecordStream(
                         True,
                         AUDIO_PARAMETERS,
                     ),
                 )
 
-                current_logger_chat = logger_chat
-                current_target_chat = target_chat
+            current_logger_chat = logger_chat
+            current_target_chat = target_chat
 
-                await message.reply(
-                    "✅ **Voice bridge setup completed.**\n\n"
-                    f"📡 Logger group: `{logger_chat}`\n"
-                    f"🔊 Target group: `{target_chat}`\n"
-                    f"🎚 Gain: `{current_volume}%`"
-                )
+            await message.reply(
+                "✅ **Voice bridge initialized**\n\n"
+                f"📡 Logger group: `{logger_chat}`\n"
+                f"🔊 Target group: `{target_chat}`\n"
+                f"🎚 Gain: `{current_volume}%`\n\n"
+                "The bridge forwards incoming audio from the logger "
+                "group to the target group."
+            )
 
-            except Exception as e:
-                logger.exception("Failed to start voice bridge")
+        except Exception as e:
+            logger.exception("Failed to initialize voice bridge")
 
-                for chat_id in (logger_chat, target_chat):
-                    try:
-                        await call_py.leave_call(chat_id)
-                    except Exception:
-                        logger.warning(
-                            "Cleanup failed for chat %s",
-                            chat_id,
-                            exc_info=True,
-                        )
+            for chat_id in (logger_chat, target_chat):
+                try:
+                    await call_py.leave_call(chat_id)
+                except Exception:
+                    logger.exception(
+                        "Cleanup failed for group %s",
+                        chat_id,
+                    )
 
-                current_logger_chat = None
-                current_target_chat = None
+            current_logger_chat = None
+            current_target_chat = None
 
-                await message.reply(
-                    "❌ Could not start the voice bridge.\n\n"
-                    f"Error: `{type(e).__name__}: {e}`\n\n"
-                    "Check that both groups have active voice chats, "
-                    "the account can join, and the installed PyTgCalls "
-                    "version supports the requested methods."
-                )
-
-    except ValueError:
-        await message.reply(
-            "❌ Both group IDs must be numeric."
-        )
-
-    except Exception as e:
-        logger.exception("Join VC error")
-        await message.reply(
-            f"❌ Join failed: {type(e).__name__}: {e}"
-        )
+            await message.reply(
+                "❌ **Bridge initialization failed**\n\n"
+                f"Error: `{type(e).__name__}: {e}`\n\n"
+                "Check the Heroku logs and confirm both groups have "
+                "active voice chats and the account can join them."
+            )
 
 
-# ================= COMMAND: .VOLUME =================
+# ================= .VOLUME =================
 @app.on_message(
     filters.command("volume", prefixes=".") & sudo_filter
 )
@@ -353,27 +346,25 @@ async def set_volume(client: Client, message: Message):
 
         if not 1 <= value <= 500:
             await message.reply(
-                "⚠️ Choose a value between 1 and 500."
+                "⚠️ Enter a value between 1 and 500."
             )
             return
 
         current_volume = value
 
         await message.reply(
-            f"🔊 Requested audio gain set to `{current_volume}%`."
+            f"🔊 Gain set to `{current_volume}%`."
         )
 
     except ValueError:
-        await message.reply(
-            "❌ Enter a valid number."
-        )
+        await message.reply("❌ Enter a valid number.")
 
     except Exception as e:
-        logger.exception("Volume error")
-        await message.reply(f"❌ Volume error: {e}")
+        logger.exception("Volume update failed")
+        await message.reply(f"❌ Error: {e}")
 
 
-# ================= COMMAND: .LEAVEVC =================
+# ================= .LEAVEVC =================
 @app.on_message(
     filters.command("leavevc", prefixes=".") & sudo_filter
 )
@@ -406,9 +397,8 @@ async def leave_vc(client: Client, message: Message):
 
             except Exception as e:
                 errors.append(f"{chat_id}: {e}")
-
                 logger.exception(
-                    "Failed leaving chat %s",
+                    "Could not leave group %s",
                     chat_id,
                 )
 
@@ -430,7 +420,7 @@ async def leave_vc(client: Client, message: Message):
 async def main():
     global USERBOT_ID
 
-    logger.info("Starting Telegram Fight Voice Bridge...")
+    logger.info("Starting Telegram Fight Voice Chat Bot...")
 
     await app.start()
 
@@ -467,7 +457,7 @@ if __name__ == "__main__":
         loop.run_until_complete(main())
 
     except KeyboardInterrupt:
-        logger.info("Bot stopped by keyboard interrupt.")
+        logger.info("Bot stopped.")
 
     except Exception:
         logger.exception("Fatal startup error.")
