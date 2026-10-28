@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import numpy as np
@@ -47,8 +48,18 @@ call_py = PyTgCalls(app)
 # ================= BRIDGE STATE =================
 current_logger_chat = None
 current_target_chat = None
-current_volume = 100
 USERBOT_ID = None
+
+# Audio controls
+current_volume = 100       # 1-500
+current_echo = 0            # 0-10
+current_gain = 0            # 0-50; 0 means no added distortion
+
+# Echo buffer: 180 ms delay at 48 kHz stereo.
+SAMPLE_RATE = 48000
+CHANNELS = 2
+ECHO_DELAY_SAMPLES = int(SAMPLE_RATE * 0.18) * CHANNELS
+echo_buffer = np.zeros(ECHO_DELAY_SAMPLES, dtype=np.float32)
 
 bridge_lock = asyncio.Lock()
 
@@ -75,6 +86,72 @@ def is_authorized(_, __, message: Message):
 sudo_filter = filters.create(is_authorized)
 
 
+# ================= AUDIO PROCESSING =================
+def process_audio(raw_audio: bytes) -> bytes:
+    """
+    Apply volume, echo and optional distortion to incoming PCM audio.
+    Uses int16 PCM input/output.
+    """
+    global echo_buffer
+
+    if not raw_audio:
+        return raw_audio
+
+    audio = np.frombuffer(raw_audio, dtype=np.int16)
+
+    if audio.size == 0:
+        return raw_audio
+
+    audio = audio.astype(np.float32)
+
+    # 1. Volume control.
+    # Higher settings increase loudness but may also increase clipping.
+    volume_multiplier = current_volume / 100.0
+    audio *= volume_multiplier
+
+    # 2. Echo control.
+    # Echo 0 disables the effect; 1-10 gradually increases it.
+    if current_echo > 0:
+        if len(echo_buffer) != ECHO_DELAY_SAMPLES:
+            echo_buffer = np.zeros(
+                ECHO_DELAY_SAMPLES,
+                dtype=np.float32,
+            )
+
+        combined = np.concatenate((echo_buffer, audio))
+
+        # Samples delayed by approximately 180 ms.
+        delayed = combined[:len(audio)]
+
+        # Save recent samples for the next audio callback.
+        echo_buffer = combined[-ECHO_DELAY_SAMPLES:].copy()
+
+        # Moderate feedback-free echo mix.
+        echo_strength = current_echo / 10.0
+        audio = audio + delayed * (0.15 * echo_strength)
+
+    # 3. Distortion control.
+    # Gain 0 keeps the added distortion disabled.
+    # Higher values create progressively stronger saturation.
+    if current_gain > 0:
+        drive = 1.0 + (current_gain / 5.0)
+        audio = 32767.0 * np.tanh(
+            (audio / 32767.0) * drive
+        )
+
+    # Soft limiter to prevent integer overflow.
+    # Extremely high volume can still sound compressed/distorted.
+    audio = 32767.0 * np.tanh(audio / 32767.0)
+
+    audio = np.clip(
+        audio,
+        -32768,
+        32767,
+    ).astype(np.int16)
+
+    return audio.tobytes()
+
+
 # ================= AUDIO BRIDGE =================
 @call_py.on_update(
     call_filters.stream_frame(
@@ -83,17 +160,13 @@ sudo_filter = filters.create(is_authorized)
     )
 )
 async def relay_audio(_, update: StreamFrames):
-    global current_logger_chat
-    global current_target_chat
-    global current_volume
-
     logger_chat = current_logger_chat
     target_chat = current_target_chat
 
     if logger_chat is None or target_chat is None:
         return
 
-    # Only forward audio originating in the logger group.
+    # Only forward incoming audio from the logger group.
     if update.chat_id != logger_chat:
         return
 
@@ -112,19 +185,12 @@ async def relay_audio(_, update: StreamFrames):
 
         audio = np.concatenate(frame_arrays)
 
-        # Apply gain and prevent integer overflow.
-        gain = current_volume / 100.0
-
-        audio = np.clip(
-            audio.astype(np.float32) * gain,
-            -32768,
-            32767,
-        ).astype(np.int16)
+        processed_audio = process_audio(audio.tobytes())
 
         await call_py.send_frame(
             target_chat,
             Device.MICROPHONE,
-            audio.tobytes(),
+            processed_audio,
         )
 
     except Exception:
@@ -138,10 +204,12 @@ async def relay_audio(_, update: StreamFrames):
 async def help_command(client: Client, message: Message):
     await message.reply(
         "🔥 **Telegram Fight Voice Chat Bot** 🔥\n\n"
-        "• `.help` - Show help.\n"
+        "• `.help` - Show all commands.\n"
         "• `.joinvc <logger_id> <target_id>` - Start bridge.\n"
         "• `.leavevc` - Stop bridge.\n"
-        "• `.volume <1-500>` - Set audio gain.\n"
+        "• `.volume <1-500>` - Set output volume.\n"
+        "• `.echo <0-10>` - Set echo; 0 disables it.\n"
+        "• `.gain <0-50>` - Set distortion; 0 disables it.\n"
         "• `.addsudo <user_id>` - Add sudo user.\n"
         "• `.rmsudo <user_id>` - Remove sudo user.\n"
         "• `.sudolist` - Show sudo users."
@@ -233,6 +301,7 @@ async def sudo_list(client: Client, message: Message):
 async def join_vc(client: Client, message: Message):
     global current_logger_chat
     global current_target_chat
+    global echo_buffer
 
     args = (message.text or "").split()
 
@@ -270,7 +339,7 @@ async def join_vc(client: Client, message: Message):
         )
 
         try:
-            # Prepare the outgoing audio stream in both groups.
+            # Prepare outgoing audio streams in both groups.
             for chat_id in (logger_chat, target_chat):
                 await call_py.play(
                     chat_id,
@@ -293,13 +362,21 @@ async def join_vc(client: Client, message: Message):
             current_logger_chat = logger_chat
             current_target_chat = target_chat
 
+            # Reset echo history for a fresh bridge.
+            echo_buffer = np.zeros(
+                ECHO_DELAY_SAMPLES,
+                dtype=np.float32,
+            )
+
             await message.reply(
                 "✅ **Voice bridge initialized**\n\n"
                 f"📡 Logger group: `{logger_chat}`\n"
                 f"🔊 Target group: `{target_chat}`\n"
-                f"🎚 Gain: `{current_volume}%`\n\n"
-                "The bridge forwards incoming audio from the logger "
-                "group to the target group."
+                f"🎚 Volume: `{current_volume}/500`\n"
+                f"🔁 Echo: `{current_echo}/10`\n"
+                f"🎛 Gain: `{current_gain}/50`\n\n"
+                "Incoming audio from the logger group will be "
+                "processed and forwarded to the target group."
             )
 
         except Exception as e:
@@ -320,8 +397,8 @@ async def join_vc(client: Client, message: Message):
             await message.reply(
                 "❌ **Bridge initialization failed**\n\n"
                 f"Error: `{type(e).__name__}: {e}`\n\n"
-                "Check the Heroku logs and confirm both groups have "
-                "active voice chats and the account can join them."
+                "Check the Heroku logs and confirm both groups "
+                "have active voice chats and the account can join them."
             )
 
 
@@ -336,7 +413,7 @@ async def set_volume(client: Client, message: Message):
 
     if len(args) < 2:
         await message.reply(
-            f"Current gain: `{current_volume}%`\n"
+            f"🔊 Current volume: `{current_volume}/500`\n"
             "Usage: `.volume <1-500>`"
         )
         return
@@ -353,7 +430,7 @@ async def set_volume(client: Client, message: Message):
         current_volume = value
 
         await message.reply(
-            f"🔊 Gain set to `{current_volume}%`."
+            f"🔊 Volume setting updated to `{current_volume}/500`."
         )
 
     except ValueError:
@@ -364,6 +441,100 @@ async def set_volume(client: Client, message: Message):
         await message.reply(f"❌ Error: {e}")
 
 
+# ================= .ECHO =================
+@app.on_message(
+    filters.command("echo", prefixes=".") & sudo_filter
+)
+async def set_echo(client: Client, message: Message):
+    global current_echo
+    global echo_buffer
+
+    args = (message.text or "").split()
+
+    if len(args) < 2:
+        await message.reply(
+            f"🔁 Current echo: `{current_echo}/10`\n"
+            "Usage: `.echo <0-10>`\n"
+            "Use `.echo 0` to turn echo off."
+        )
+        return
+
+    try:
+        value = int(args[1])
+
+        if not 0 <= value <= 10:
+            await message.reply(
+                "⚠️ Echo must be between 0 and 10."
+            )
+            return
+
+        current_echo = value
+
+        if value == 0:
+            echo_buffer = np.zeros(
+                ECHO_DELAY_SAMPLES,
+                dtype=np.float32,
+            )
+            await message.reply("🔁 Echo disabled.")
+
+        else:
+            await message.reply(
+                f"🔁 Echo set to `{current_echo}/10`."
+            )
+
+    except ValueError:
+        await message.reply("❌ Enter a valid number.")
+
+    except Exception as e:
+        logger.exception("Echo update failed")
+        await message.reply(f"❌ Error: {e}")
+
+
+# ================= .GAIN =================
+@app.on_message(
+    filters.command("gain", prefixes=".") & sudo_filter
+)
+async def set_gain(client: Client, message: Message):
+    global current_gain
+
+    args = (message.text or "").split()
+
+    if len(args) < 2:
+        await message.reply(
+            f"🎛 Current distortion: `{current_gain}/50`\n"
+            "Usage: `.gain <0-50>`\n"
+            "Use `.gain 0` to disable added distortion."
+        )
+        return
+
+    try:
+        value = int(args[1])
+
+        if not 0 <= value <= 50:
+            await message.reply(
+                "⚠️ Gain must be between 0 and 50."
+            )
+            return
+
+        current_gain = value
+
+        if value == 0:
+            await message.reply(
+                "🎛 Added distortion disabled. Clean processing selected."
+            )
+        else:
+            await message.reply(
+                f"🎛 Distortion setting updated to `{current_gain}/50`."
+            )
+
+    except ValueError:
+        await message.reply("❌ Enter a valid number.")
+
+    except Exception as e:
+        logger.exception("Gain update failed")
+        await message.reply(f"❌ Error: {e}")
+
+
 # ================= .LEAVEVC =================
 @app.on_message(
     filters.command("leavevc", prefixes=".") & sudo_filter
@@ -371,6 +542,7 @@ async def set_volume(client: Client, message: Message):
 async def leave_vc(client: Client, message: Message):
     global current_logger_chat
     global current_target_chat
+    global echo_buffer
 
     async with bridge_lock:
         if (
@@ -405,6 +577,11 @@ async def leave_vc(client: Client, message: Message):
         current_logger_chat = None
         current_target_chat = None
 
+        echo_buffer = np.zeros(
+            ECHO_DELAY_SAMPLES,
+            dtype=np.float32,
+        )
+
         if errors:
             await message.reply(
                 "⚠️ Some voice chats may not have disconnected:\n"
@@ -412,7 +589,7 @@ async def leave_vc(client: Client, message: Message):
             )
         else:
             await message.reply(
-                "🔌 Left both voice chats."
+                "🔌 Left both voice chats. Audio bridge stopped."
             )
 
 
