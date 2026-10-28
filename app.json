@@ -1,0 +1,25 @@
+{
+  "name": "Telegram Fight Voice Chat Bot",
+  "description": "A powerful Telegram Userbot and Voice Chat bridge with volume boost and config support.",
+  "repository": "https://github.com/ITZ-HAKEEB/VAMPIRE-FIGHT",
+  "keywords": ["telegram", "userbot", "pyrogram", "pytgcalls", "voicechat"],
+  "stack": "container",
+  "env": {
+    "API_ID": {
+      "description": "Your Telegram API ID from my.telegram.org",
+      "value": "32014721"
+    },
+    "API_HASH": {
+      "description": "Your Telegram API Hash from my.telegram.org",
+      "value": "8eb58f2e47f085dea1eb8eea0b68df12"
+    },
+    "SESSION_STRING": {
+      "description": "Your Pyrogram v2 Session String",
+      "value": ""
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram Owner User ID",
+      "value": "8538619965"
+    }
+  }
+}
