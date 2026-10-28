@@ -48,18 +48,19 @@ current_logger_chat = None
 current_target_chat = None
 USERBOT_ID = None
 
-# Volume is a percentage-style control.
-# Values above 100 increase processing gain, not guaranteed
-# acoustic loudness on the listener's device.
-current_volume = 200       # 1-500
-current_echo = 0           # 0-10
-current_gain = 0           # 0-200
+current_volume = 200       # 1-1000
+current_echo = 0           # 0-200
+current_gain = 0           # 0-500
+current_bass = 0           # 0-300
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
 
 ECHO_DELAY_SAMPLES = int(SAMPLE_RATE * 0.18) * CHANNELS
 echo_buffer = np.zeros(ECHO_DELAY_SAMPLES, dtype=np.float32)
+
+# Low-frequency filter state for stereo audio
+bass_filter_state = np.zeros(CHANNELS, dtype=np.float32)
 
 bridge_lock = asyncio.Lock()
 
@@ -89,59 +90,79 @@ sudo_filter = filters.create(is_authorized)
 # ================= AUDIO PROCESSING =================
 def process_audio(raw_audio: bytes) -> bytes:
     """
-    Process incoming int16 PCM audio:
-    - Output gain
+    Process incoming stereo int16 PCM audio:
+    - Output level
     - Adjustable echo
-    - Controlled saturation/distortion
-    - Soft limiting to prevent integer overflow
+    - Bass boost
+    - Controlled saturation
+    - Soft limiting
     """
-    global echo_buffer
+    global echo_buffer, bass_filter_state
 
     if not raw_audio:
         return raw_audio
 
     audio = np.frombuffer(raw_audio, dtype=np.int16)
 
-    if audio.size == 0:
+    if audio.size < CHANNELS:
         return raw_audio
 
-    audio = audio.astype(np.float32)
+    # Keep complete stereo frames only
+    usable_size = (audio.size // CHANNELS) * CHANNELS
+    audio = audio[:usable_size].astype(np.float32)
+    audio = audio.reshape(-1, CHANNELS)
 
-    # 1. Output gain.
-    # The limiter below prevents unbounded output peaks.
-    volume_multiplier = current_volume / 100.0
-    audio *= volume_multiplier
+    # 1. Output level
+    audio *= current_volume / 100.0
 
-    # 2. Echo.
+    # 2. Bass boost
+    if current_bass > 0:
+        alpha = 0.03
+        low = np.empty_like(audio)
+        state = bass_filter_state.copy()
+
+        for i in range(len(audio)):
+            state += alpha * (audio[i] - state)
+            low[i] = state
+
+        bass_filter_state = state.copy()
+
+        # Bass 0-300; higher values may increase distortion
+        bass_amount = current_bass / 100.0
+        audio += low * bass_amount
+
+    # 3. Echo
     if current_echo == 0:
         echo_buffer.fill(0)
     else:
+        flat_audio = audio.reshape(-1)
+
         if len(echo_buffer) != ECHO_DELAY_SAMPLES:
             echo_buffer = np.zeros(
                 ECHO_DELAY_SAMPLES,
                 dtype=np.float32,
             )
 
-        combined = np.concatenate((echo_buffer, audio))
-        delayed = combined[:len(audio)]
+        combined = np.concatenate((echo_buffer, flat_audio))
+        delayed = combined[:len(flat_audio)]
 
         echo_buffer = combined[-ECHO_DELAY_SAMPLES:].copy()
 
-        echo_strength = current_echo / 10.0
-        audio += delayed * (0.20 * echo_strength)
+        # The setting controls echo strength, not an amplification multiplier
+        echo_strength = current_echo / 200.0
+        flat_audio = flat_audio + delayed * (0.35 * echo_strength)
 
-    # 3. Controlled saturation.
-    # Higher gain produces a stronger compressed/distorted character.
-    # Gain 0 leaves this additional effect disabled.
+        audio = flat_audio.reshape(-1, CHANNELS)
+
+    # 4. Controlled saturation/distortion
     if current_gain > 0:
-        drive = 1.0 + (current_gain / 20.0)
+        drive = 1.0 + (current_gain / 50.0)
+
         audio = 32767.0 * np.tanh(
             (audio / 32767.0) * drive
         )
 
-    # 4. Soft limiter.
-    # This keeps output peaks bounded; it cannot guarantee that
-    # highly distorted audio will remain intelligible.
+    # 5. Soft limiter
     audio = 32767.0 * np.tanh(audio / 32767.0)
 
     audio = np.clip(
@@ -150,7 +171,7 @@ def process_audio(raw_audio: bytes) -> bytes:
         32767,
     ).astype(np.int16)
 
-    return audio.tobytes()
+    return audio.reshape(-1).tobytes()
 
 
 # ================= AUDIO BRIDGE =================
@@ -206,9 +227,10 @@ async def help_command(client: Client, message: Message):
         "• `.help` - Show commands.\n"
         "• `.joinvc <logger_id> <target_id>` - Start bridge.\n"
         "• `.leavevc` - Stop bridge.\n"
-        "• `.volume <1-500>` - Set output gain.\n"
-        "• `.echo <0-10>` - Set echo; 0 disables it.\n"
-        "• `.gain <0-200>` - Set distortion; 0 disables it.\n"
+        "• `.volume <1-1000>` - Set output level.\n"
+        "• `.echo <0-200>` - Set echo; 0 disables it.\n"
+        "• `.gain <0-500>` - Set distortion; 0 disables it.\n"
+        "• `.bass <0-300>` - Set bass boost; 0 disables it.\n"
         "• `.addsudo <user_id>` - Add sudo user.\n"
         "• `.rmsudo <user_id>` - Remove sudo user.\n"
         "• `.sudolist` - Show sudo users."
@@ -301,6 +323,7 @@ async def join_vc(client: Client, message: Message):
     global current_logger_chat
     global current_target_chat
     global echo_buffer
+    global bass_filter_state
 
     args = (message.text or "").split()
 
@@ -338,7 +361,7 @@ async def join_vc(client: Client, message: Message):
         )
 
         try:
-            # Prepare outgoing streams.
+            # Prepare outgoing streams
             for chat_id in (logger_chat, target_chat):
                 await call_py.play(
                     chat_id,
@@ -348,7 +371,7 @@ async def join_vc(client: Client, message: Message):
                     ),
                 )
 
-            # Capture incoming streams.
+            # Capture incoming streams
             for chat_id in (logger_chat, target_chat):
                 await call_py.record(
                     chat_id,
@@ -365,14 +388,19 @@ async def join_vc(client: Client, message: Message):
                 ECHO_DELAY_SAMPLES,
                 dtype=np.float32,
             )
+            bass_filter_state = np.zeros(
+                CHANNELS,
+                dtype=np.float32,
+            )
 
             await message.reply(
                 "✅ **Voice bridge initialized**\n\n"
                 f"📡 Logger: `{logger_chat}`\n"
                 f"🔊 Target: `{target_chat}`\n"
-                f"🎚 Volume: `{current_volume}/500`\n"
-                f"🔁 Echo: `{current_echo}/10`\n"
-                f"🎛 Gain: `{current_gain}/200`\n\n"
+                f"🎚 Volume: `{current_volume}/1000`\n"
+                f"🔁 Echo: `{current_echo}/200`\n"
+                f"🎛 Gain: `{current_gain}/500`\n"
+                f"🔊 Bass: `{current_bass}/300`\n\n"
                 "Audio from the logger group will be processed "
                 "and forwarded to the target group."
             )
@@ -385,7 +413,7 @@ async def join_vc(client: Client, message: Message):
                     await call_py.leave_call(chat_id)
                 except Exception:
                     logger.warning(
-                        "No call to clean up for group %s",
+                        "No active call to clean up for group %s",
                         chat_id,
                     )
 
@@ -411,24 +439,24 @@ async def set_volume(client: Client, message: Message):
 
     if len(args) < 2:
         await message.reply(
-            f"🔊 Current volume: `{current_volume}/500`\n"
-            "Usage: `.volume <1-500>`"
+            f"🔊 Current volume: `{current_volume}/1000`\n"
+            "Usage: `.volume <1-1000>`"
         )
         return
 
     try:
         value = int(args[1])
 
-        if not 1 <= value <= 500:
+        if not 1 <= value <= 1000:
             await message.reply(
-                "⚠️ Enter a value between 1 and 500."
+                "⚠️ Enter a value between 1 and 1000."
             )
             return
 
         current_volume = value
 
         await message.reply(
-            f"🔊 Volume setting updated to `{current_volume}/500`."
+            f"🔊 Volume setting updated to `{current_volume}/1000`."
         )
 
     except ValueError:
@@ -451,8 +479,8 @@ async def set_echo(client: Client, message: Message):
 
     if len(args) < 2:
         await message.reply(
-            f"🔁 Current echo: `{current_echo}/10`\n"
-            "Usage: `.echo <0-10>`\n"
+            f"🔁 Current echo: `{current_echo}/200`\n"
+            "Usage: `.echo <0-200>`\n"
             "Use `.echo 0` to turn echo off."
         )
         return
@@ -460,9 +488,9 @@ async def set_echo(client: Client, message: Message):
     try:
         value = int(args[1])
 
-        if not 0 <= value <= 10:
+        if not 0 <= value <= 200:
             await message.reply(
-                "⚠️ Echo must be between 0 and 10."
+                "⚠️ Echo must be between 0 and 200."
             )
             return
 
@@ -473,7 +501,7 @@ async def set_echo(client: Client, message: Message):
             await message.reply("🔁 Echo disabled.")
         else:
             await message.reply(
-                f"🔁 Echo set to `{current_echo}/10`."
+                f"🔁 Echo set to `{current_echo}/200`."
             )
 
     except ValueError:
@@ -495,8 +523,8 @@ async def set_gain(client: Client, message: Message):
 
     if len(args) < 2:
         await message.reply(
-            f"🎛 Current distortion: `{current_gain}/200`\n"
-            "Usage: `.gain <0-200>`\n"
+            f"🎛 Current distortion: `{current_gain}/500`\n"
+            "Usage: `.gain <0-500>`\n"
             "Use `.gain 0` to disable added distortion."
         )
         return
@@ -504,9 +532,9 @@ async def set_gain(client: Client, message: Message):
     try:
         value = int(args[1])
 
-        if not 0 <= value <= 200:
+        if not 0 <= value <= 500:
             await message.reply(
-                "⚠️ Gain must be between 0 and 200."
+                "⚠️ Gain must be between 0 and 500."
             )
             return
 
@@ -518,7 +546,7 @@ async def set_gain(client: Client, message: Message):
             )
         else:
             await message.reply(
-                f"🎛 Distortion set to `{current_gain}/200`."
+                f"🎛 Distortion set to `{current_gain}/500`."
             )
 
     except ValueError:
@@ -526,6 +554,51 @@ async def set_gain(client: Client, message: Message):
 
     except Exception as e:
         logger.exception("Gain update failed")
+        await message.reply(f"❌ Error: {e}")
+
+
+# ================= .BASS =================
+@app.on_message(
+    filters.command("bass", prefixes=".") & sudo_filter
+)
+async def set_bass(client: Client, message: Message):
+    global current_bass
+    global bass_filter_state
+
+    args = (message.text or "").split()
+
+    if len(args) < 2:
+        await message.reply(
+            f"🔊 Current bass: `{current_bass}/300`\n"
+            "Usage: `.bass <0-300>`\n"
+            "Use `.bass 0` to disable bass boost."
+        )
+        return
+
+    try:
+        value = int(args[1])
+
+        if not 0 <= value <= 300:
+            await message.reply(
+                "⚠️ Bass must be between 0 and 300."
+            )
+            return
+
+        current_bass = value
+        bass_filter_state.fill(0)
+
+        if value == 0:
+            await message.reply("🔊 Bass boost disabled.")
+        else:
+            await message.reply(
+                f"🔊 Bass boost set to `{value}/300`."
+            )
+
+    except ValueError:
+        await message.reply("❌ Enter a valid number.")
+
+    except Exception as e:
+        logger.exception("Bass update failed")
         await message.reply(f"❌ Error: {e}")
 
 
@@ -537,6 +610,7 @@ async def leave_vc(client: Client, message: Message):
     global current_logger_chat
     global current_target_chat
     global echo_buffer
+    global bass_filter_state
 
     async with bridge_lock:
         if (
@@ -571,6 +645,7 @@ async def leave_vc(client: Client, message: Message):
         current_logger_chat = None
         current_target_chat = None
         echo_buffer.fill(0)
+        bass_filter_state.fill(0)
 
         if errors:
             await message.reply(
