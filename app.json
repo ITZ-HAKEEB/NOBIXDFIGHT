@@ -1,7 +1,7 @@
 {
   "name": "Nobi XD Fight Bot",
   "description": "Telegram Voice Chat Fight Bot with Dynamic Hosting Panel",
-  "repository": "https://github.com/your-username/NOBIXDFIGHT",
+  "repository": "https://github.com/ITZ-HAKEEB/NOBIXDFIGHT",
   "logo": "https://graph.org/file/sample-logo.jpg",
   "keywords": ["python", "pyrogram", "telegram", "voice-chat", "fight-bot"],
   "stack": "container",
@@ -25,6 +25,21 @@
       "description": "Your Telegram Owner User ID",
       "value": "",
       "required": true
+    },
+    "OWNER_USERNAME": {
+      "description": "Your Telegram Owner Username (without @)",
+      "value": "your_username",
+      "required": false
+    },
+    "SUPPORT_CHAT": {
+      "description": "Your Support Group or Channel Link",
+      "value": "https://t.me/your_support_chat",
+      "required": false
+    },
+    "UPDATE_CHANNEL": {
+      "description": "Your Updates Channel Link",
+      "value": "https://t.me/your_updates_channel",
+      "required": false
     }
   },
   "formation": {
