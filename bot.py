@@ -49,17 +49,16 @@ current_target_chat = None
 USERBOT_ID = None
 
 current_volume = 200       # 1-1000
-current_boost = 100        # 1-5000; 100 is neutral
-current_echo = 0           # 0-200
-current_gain = 0           # 0-500
-current_bass = 0           # 0-300
+current_boost = 100        # 1-5000
+current_echo = 0            # 0-200
+current_gain = 0            # 0-500
+current_bass = 0            # 0-300
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
 
 ECHO_DELAY_SAMPLES = int(SAMPLE_RATE * 0.18) * CHANNELS
 echo_buffer = np.zeros(ECHO_DELAY_SAMPLES, dtype=np.float32)
-
 bass_filter_state = np.zeros(CHANNELS, dtype=np.float32)
 
 bridge_lock = asyncio.Lock()
@@ -72,16 +71,7 @@ AUDIO_PARAMETERS = AudioParameters(
 
 # ================= BOOST CURVE =================
 def get_boost_multiplier(value: int) -> float:
-    """
-    Map boost 1-5000 to a controlled multiplier.
-
-    1   -> 0.1x
-    100 -> 1.0x
-    5000 -> 2.5x
-
-    The final limiter reduces clipping.
-    High boost settings can still sound distorted.
-    """
+    """Convert boost setting to a controlled multiplier."""
     value = max(1, min(5000, int(value)))
 
     if value <= 100:
@@ -110,13 +100,15 @@ sudo_filter = filters.create(is_authorized)
 # ================= AUDIO PROCESSING =================
 def process_audio(raw_audio: bytes) -> bytes:
     """
-    Process incoming stereo int16 PCM audio:
-    - Output volume
-    - Controlled boost
+    Process stereo int16 PCM audio.
+
+    Features:
+    - Volume: 1-1000
+    - Boost: 1-5000
     - Bass enhancement
     - Echo
-    - Optional saturation
-    - Soft limiting
+    - Optional distortion
+    - Peak limiter to reduce hard clipping
     """
     global echo_buffer, bass_filter_state
 
@@ -133,14 +125,13 @@ def process_audio(raw_audio: bytes) -> bytes:
     audio = audio[:usable_size].astype(np.float32)
     audio = audio.reshape(-1, CHANNELS)
 
-    # 1. Volume
+    # 1. Volume.
     audio *= current_volume / 100.0
 
-    # 2. Boost
-    # The boost curve is intentionally bounded to reduce clipping.
+    # 2. Boost.
     audio *= get_boost_multiplier(current_boost)
 
-    # 3. Bass boost
+    # 3. Bass enhancement.
     if current_bass > 0:
         alpha = 0.03
         low = np.empty_like(audio)
@@ -155,7 +146,7 @@ def process_audio(raw_audio: bytes) -> bytes:
         bass_amount = current_bass / 100.0
         audio += low * bass_amount
 
-    # 4. Echo
+    # 4. Echo.
     if current_echo == 0:
         echo_buffer.fill(0)
     else:
@@ -179,7 +170,8 @@ def process_audio(raw_audio: bytes) -> bytes:
 
         audio = flat_audio.reshape(-1, CHANNELS)
 
-    # 5. Optional controlled distortion
+    # 5. Optional distortion.
+    # High values add distortion, so use moderate settings for clarity.
     if current_gain > 0:
         drive = 1.0 + min(current_gain, 500) / 50.0
 
@@ -187,9 +179,15 @@ def process_audio(raw_audio: bytes) -> bytes:
             (audio / 32767.0) * drive
         )
 
-    # 6. Soft limiter
-    # Prevents hard digital clipping; it cannot eliminate all distortion.
-    audio = 32767.0 * np.tanh(audio / 32767.0)
+    # 6. Peak limiter.
+    # Preserve the processed signal unless its peak risks clipping.
+    # This avoids hard digital clipping, though extreme gain can still
+    # reduce audio clarity.
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    target_peak = 30000.0
+
+    if peak > target_peak:
+        audio *= target_peak / peak
 
     audio = np.clip(
         audio,
@@ -486,7 +484,8 @@ async def set_volume(client: Client, message: Message):
         current_volume = value
 
         await message.reply(
-            f"🔊 Volume setting updated to `{current_volume}/1000`."
+            f"🔊 Volume setting updated to `{current_volume}/1000`.\n"
+            "⚠️ Very high values may distort the audio."
         )
 
     except ValueError:
