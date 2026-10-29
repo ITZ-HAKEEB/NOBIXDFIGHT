@@ -8,12 +8,11 @@ from pyrogram.errors import (
     PasswordHashInvalid
 )
 
-from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, SUPPORT_CHAT, UPDATE_CHANNEL, OWNER_USERNAME
 
-# Temporary memory storage for states and user sessions
 USER_STATE = {}
 USER_DATA = {}
-HOSTED_USERS = {}  # Format: {user_id: {"full_name": ..., "username": ..., "phone": ..., "2fa": ..., "session": ...}}
+HOSTED_USERS = {}
 
 app = Client(
     "NobiXDFightHostBot",
@@ -25,10 +24,10 @@ app = Client(
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👑 Owner", url="https://t.me/your_username"),
+        [InlineKeyboardButton("👑 Owner", url=f"https://t.me/{OWNER_USERNAME}"),
          InlineKeyboardButton("🛠 Help", callback_data="help_menu")],
-        [InlineKeyboardButton("💬 Support", url="https://t.me/support_chat"),
-         InlineKeyboardButton("📢 Updates", url="https://t.me/updates_channel")],
+        [InlineKeyboardButton("💬 Support", url=SUPPORT_CHAT),
+         InlineKeyboardButton("📢 Updates", url=UPDATE_CHANNEL)],
         [InlineKeyboardButton("🚀 Host Bot", callback_data="host_start")]
     ])
     await message.reply_text(
@@ -210,4 +209,4 @@ async def admin_actions_callback(client: Client, callback_query: CallbackQuery):
 if __name__ == "__main__":
     print("🚀 Nobi XD Fight Bot Host Panel Started Successfully!")
     app.run()
-      
+                         
