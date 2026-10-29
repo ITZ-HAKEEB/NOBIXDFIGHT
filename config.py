@@ -1,7 +1,7 @@
 import os
 
-# Telegram API Credentials
-API_ID = int(os.getenv("API_ID", "32014721"))
-API_HASH = os.getenv("API_HASH", "8eb58f2e47f085dea1eb8eea0b68df12")
-SESSION_STRING = os.getenv("SESSION_STRING", "BQAA9-QASm1qh9c8aptRPp2eC-jVbgQsDrUVQzpXw2BkFy6jTJsvLVENGot1a0HRZtcwUxhByKmi0QL9JDJEuc8LEJ_vbJNMkOzzvTqTWn-2o7rtSzOMNFT0RGSYNdNg_WDeVfRsbMiRJb5ZSY2Eqh0vHlUeSnYL1paECtSIcqXdU6oJLHH7gAMPG7HpwWHqcL71QSO4A-EpSRLJPsP-HKABlLoq6JMyajJUY3rk4m7opckL1x4Mf1orZ76zfJqGIIli-IUqn7ZAeZwlVNXQYyl2DFBCb8kjOxl7mnF2SXnMZN2SXWORhRrpYZUdEizYF3Z569BLnxUN2ZcWZm-HIUueNcDhuwAAAAHoB2VWAA")
-OWNER_ID = int(os.getenv("OWNER_ID", "8538619965"))
+# API Credentials from environment or config
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
