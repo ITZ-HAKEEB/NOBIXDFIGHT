@@ -69,7 +69,7 @@ When deploying to Heroku, make sure to set the following Config Vars:
 
 1. Repository को क्लोन करें और फ़ोल्डर में जाएँ:
 ```bash
-git clone https://github.com && cd NOBIXDFIGHT
+git clone https://github.com/ITZ-HAKEEB/NOBIXDFIGHT && cd NOBIXDFIGHT
 ```
 
 2. पर्यावरण वेरिएबल्स (Environment Variables) सेट करें:
