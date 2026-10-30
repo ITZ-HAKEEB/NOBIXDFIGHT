@@ -48,17 +48,20 @@ current_logger_chat = None
 current_target_chat = None
 USERBOT_ID = None
 
-current_volume = 200       # 1-1000
-current_boost = 100        # 1-5000
-current_echo = 0            # 0-200
-current_gain = 0            # 0-500
-current_bass = 0            # 0-300
+current_volume = 12000
+current_boost = 100
+current_echo = 10000
+current_gain = 2000
+current_bass = 1500
+current_double = True
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
 
-ECHO_DELAY_SAMPLES = int(SAMPLE_RATE * 0.18) * CHANNELS
+ECHO_DELAY_SAMPLES = int(SAMPLE_RATE * 0.24) * CHANNELS
+DOUBLE_DELAY_SAMPLES = int(SAMPLE_RATE * 0.022) * CHANNELS
 echo_buffer = np.zeros(ECHO_DELAY_SAMPLES, dtype=np.float32)
+double_buffer = np.zeros(DOUBLE_DELAY_SAMPLES, dtype=np.float32)
 bass_filter_state = np.zeros(CHANNELS, dtype=np.float32)
 
 bridge_lock = asyncio.Lock()
@@ -99,103 +102,67 @@ sudo_filter = filters.create(is_authorized)
 
 # ================= AUDIO PROCESSING =================
 def process_audio(raw_audio: bytes) -> bytes:
-    """
-    Process stereo int16 PCM audio.
-
-    Features:
-    - Volume: 1-1000
-    - Boost: 1-5000
-    - Bass enhancement
-    - Echo
-    - Optional distortion
-    - Peak limiter to reduce hard clipping
-    """
-    global echo_buffer, bass_filter_state
+    """Controlled voice effects with a short-delay double and output limiter."""
+    global echo_buffer, double_buffer, bass_filter_state
 
     if not raw_audio:
         return raw_audio
-
-    audio = np.frombuffer(raw_audio, dtype=np.int16)
-
-    if audio.size < CHANNELS:
+    samples = np.frombuffer(raw_audio, dtype=np.int16)
+    if samples.size < CHANNELS:
         return raw_audio
 
-    # Keep complete stereo frames only.
-    usable_size = (audio.size // CHANNELS) * CHANNELS
-    audio = audio[:usable_size].astype(np.float32)
-    audio = audio.reshape(-1, CHANNELS)
+    usable = (samples.size // CHANNELS) * CHANNELS
+    audio = samples[:usable].astype(np.float32).reshape(-1, CHANNELS)
 
-    # 1. Volume.
-    audio *= current_volume / 100.0
-
-    # 2. Boost.
+    # 0-12000 control scale, mapped to a safe maximum of about +6 dB.
+    volume = max(0, min(12000, int(current_volume)))
+    audio *= 10.0 ** ((volume / 12000.0) * 6.0 / 20.0)
     audio *= get_boost_multiplier(current_boost)
 
-    # 3. Bass enhancement.
+    # Double voice: blend a quiet copy delayed by about 22 ms.
+    flat = audio.reshape(-1)
+    if current_double:
+        joined = np.concatenate((double_buffer, flat))
+        delayed = joined[:len(flat)]
+        double_buffer = joined[-DOUBLE_DELAY_SAMPLES:].copy()
+        audio = (flat + delayed * 0.28).reshape(-1, CHANNELS)
+    else:
+        double_buffer.fill(0)
+
+    # Bass enhancement.
     if current_bass > 0:
-        alpha = 0.03
         low = np.empty_like(audio)
         state = bass_filter_state.copy()
-
         for i in range(len(audio)):
-            state += alpha * (audio[i] - state)
+            state += 0.025 * (audio[i] - state)
             low[i] = state
-
         bass_filter_state = state.copy()
+        amount = min(1500, max(0, int(current_bass))) / 1500.0
+        audio += low * (0.65 * amount)
 
-        bass_amount = current_bass / 100.0
-        audio += low * bass_amount
-
-    # 4. Echo.
-    if current_echo == 0:
-        echo_buffer.fill(0)
+    # Echo repeat with a controlled wet mix.
+    if current_echo > 0:
+        flat = audio.reshape(-1)
+        joined = np.concatenate((echo_buffer, flat))
+        delayed = joined[:len(flat)]
+        echo_buffer = joined[-ECHO_DELAY_SAMPLES:].copy()
+        wet = min(10000, max(0, int(current_echo))) / 10000.0
+        audio = (flat + delayed * (0.28 * wet)).reshape(-1, CHANNELS)
     else:
-        flat_audio = audio.reshape(-1)
+        echo_buffer.fill(0)
 
-        if len(echo_buffer) != ECHO_DELAY_SAMPLES:
-            echo_buffer = np.zeros(
-                ECHO_DELAY_SAMPLES,
-                dtype=np.float32,
-            )
+    # Gain = soft saturation/punch, not unlimited amplification.
+    gain = min(2000, max(0, int(current_gain)))
+    if gain:
+        drive = 1.0 + (gain / 2000.0) * 2.0
+        audio = 32767.0 * np.tanh((audio / 32767.0) * drive)
 
-        combined = np.concatenate((echo_buffer, flat_audio))
-        delayed = combined[:len(flat_audio)]
-
-        echo_buffer = combined[-ECHO_DELAY_SAMPLES:].copy()
-
-        echo_strength = current_echo / 200.0
-        flat_audio = flat_audio + delayed * (
-            0.35 * echo_strength
-        )
-
-        audio = flat_audio.reshape(-1, CHANNELS)
-
-    # 5. Optional distortion.
-    # High values add distortion, so use moderate settings for clarity.
-    if current_gain > 0:
-        drive = 1.0 + min(current_gain, 500) / 50.0
-
-        audio = 32767.0 * np.tanh(
-            (audio / 32767.0) * drive
-        )
-
-    # 6. Peak limiter.
-    # Preserve the processed signal unless its peak risks clipping.
-    # This avoids hard digital clipping, though extreme gain can still
-    # reduce audio clarity.
+    # Limiter avoids hard clipping.
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-    target_peak = 30000.0
+    if peak > 24500.0:
+        audio *= 24500.0 / peak
 
-    if peak > target_peak:
-        audio *= target_peak / peak
-
-    audio = np.clip(
-        audio,
-        -32768,
-        32767,
-    ).astype(np.int16)
-
-    return audio.reshape(-1).tobytes()
+    return np.clip(audio, -32768, 32767).astype(np.int16).reshape(-1).tobytes()
 
 
 # ================= AUDIO BRIDGE =================
@@ -242,22 +209,21 @@ async def relay_audio(_, update: StreamFrames):
 
 
 # ================= .HELP =================
-@app.on_message(
-    filters.command("help", prefixes=".") & sudo_filter
-)
+@app.on_message(filters.command("help", prefixes=".") & sudo_filter)
 async def help_command(client: Client, message: Message):
     await message.reply(
-        "🔥 **Telegram Fight Voice Chat Bot** 🔥\n\n"
-        "• `.help` - Show commands.\n"
-        "• `.joinvc <logger_id> <target_id>` - Start bridge.\n"
-        "• `.leavevc` - Stop bridge.\n"
-        "• `.volume <1-1000>` - Set output volume.\n"
-        "• `.boost <1-5000>` - Adjust controlled boost.\n"
-        "• `.echo <0-200>` - Set echo; 0 disables it.\n"
-        "• `.gain <0-500>` - Set distortion; 0 disables it.\n"
-        "• `.bass <0-300>` - Set bass boost; 0 disables it.\n"
-        "• `.addsudo <user_id>` - Add sudo user.\n"
-        "• `.rmsudo <user_id>` - Remove sudo user.\n"
+        "🔥 **Telegram Fight Voice Chat Bot** 🔥\\n\\n"
+        "• `.help` - Show commands.\\n"
+        "• `.joinvc <logger_id> <target_id>` - Start bridge.\\n"
+        "• `.leavevc` - Stop bridge.\\n"
+        "• `.volume <0-12000>` - Set output volume.\\n"
+        "• `.boost <1-5000>` - Adjust controlled boost.\\n"
+        "• `.echo <0-10000>` - Set echo; 0 disables it.\\n"
+        "• `.gain <0-2000>` - Set gain; 0 disables it.\\n"
+        "• `.bass <0-1500>` - Set bass boost; 0 disables it.\\n"
+        "• `.double on|off` - Enable/disable double voice.\\n"
+        "• `.addsudo <user_id>` - Add sudo user.\\n"
+        "• `.rmsudo <user_id>` - Remove sudo user.\\n"
         "• `.sudolist` - Show sudo users."
     )
 
@@ -353,6 +319,7 @@ async def join_vc(client: Client, message: Message):
     global current_logger_chat
     global current_target_chat
     global echo_buffer
+    global double_buffer
     global bass_filter_state
 
     args = (message.text or "").split()
@@ -420,16 +387,17 @@ async def join_vc(client: Client, message: Message):
                 CHANNELS,
                 dtype=np.float32,
             )
+            double_buffer = np.zeros(DOUBLE_DELAY_SAMPLES, dtype=np.float32)
 
             await message.reply(
                 "✅ **Voice bridge initialized**\n\n"
                 f"📡 Logger: `{logger_chat}`\n"
                 f"🔊 Target: `{target_chat}`\n"
-                f"🎚 Volume: `{current_volume}/1000`\n"
+                f"🎚 Volume: `{current_volume}/12000`\n"
                 f"📢 Boost: `{current_boost}/5000`\n"
-                f"🔁 Echo: `{current_echo}/200`\n"
-                f"🎛 Gain: `{current_gain}/500`\n"
-                f"🔊 Bass: `{current_bass}/300`\n\n"
+                f"🔁 Echo: `{current_echo}/10000`\n"
+                f"🎛 Gain: `{current_gain}/2000`\n"
+                f"🔊 Bass: `{current_bass}/1500`\n\n"
                 "Audio from the logger group will be processed "
                 "and forwarded to the target group."
             )
@@ -457,43 +425,22 @@ async def join_vc(client: Client, message: Message):
 
 
 # ================= .VOLUME =================
-@app.on_message(
-    filters.command("volume", prefixes=".") & sudo_filter
-)
+@app.on_message(filters.command("volume", prefixes=".") & sudo_filter)
 async def set_volume(client: Client, message: Message):
     global current_volume
-
     args = (message.text or "").split()
-
     if len(args) < 2:
-        await message.reply(
-            f"🔊 Current volume: `{current_volume}/1000`\n"
-            "Usage: `.volume <1-1000>`"
-        )
+        await message.reply(f"🔊 Volume: `{current_volume}/12000` | Usage: `.volume <0-12000>`")
         return
-
     try:
         value = int(args[1])
-
-        if not 1 <= value <= 1000:
-            await message.reply(
-                "⚠️ Enter a value between 1 and 1000."
-            )
+        if not 0 <= value <= 12000:
+            await message.reply("⚠️ Volume must be between 0 and 12000.")
             return
-
         current_volume = value
-
-        await message.reply(
-            f"🔊 Volume setting updated to `{current_volume}/1000`.\n"
-            "⚠️ Very high values may distort the audio."
-        )
-
+        await message.reply(f"🔊 Volume updated: `{value}/12000`. Limiter is active.")
     except ValueError:
-        await message.reply("❌ Enter a valid number.")
-
-    except Exception as e:
-        logger.exception("Volume update failed")
-        await message.reply(f"❌ Error: {e}")
+        await message.reply("❌ Enter a valid whole number.")
 
 
 # ================= .BOOST =================
@@ -543,136 +490,77 @@ async def set_boost(client: Client, message: Message):
 
 
 # ================= .ECHO =================
-@app.on_message(
-    filters.command("echo", prefixes=".") & sudo_filter
-)
+@app.on_message(filters.command("echo", prefixes=".") & sudo_filter)
 async def set_echo(client: Client, message: Message):
-    global current_echo
-    global echo_buffer
-
+    global current_echo, echo_buffer
     args = (message.text or "").split()
-
     if len(args) < 2:
-        await message.reply(
-            f"🔁 Current echo: `{current_echo}/200`\n"
-            "Usage: `.echo <0-200>`\n"
-            "Use `.echo 0` to turn echo off."
-        )
+        await message.reply(f"🔁 Echo: `{current_echo}/10000` | Usage: `.echo <0-10000>`")
         return
-
     try:
         value = int(args[1])
-
-        if not 0 <= value <= 200:
-            await message.reply(
-                "⚠️ Echo must be between 0 and 200."
-            )
+        if not 0 <= value <= 10000:
+            await message.reply("⚠️ Echo must be between 0 and 10000.")
             return
-
         current_echo = value
-
         if value == 0:
             echo_buffer.fill(0)
-            await message.reply("🔁 Echo disabled.")
-        else:
-            await message.reply(
-                f"🔁 Echo set to `{current_echo}/200`."
-            )
-
+        await message.reply(f"🔁 Echo updated: `{value}/10000`.")
     except ValueError:
-        await message.reply("❌ Enter a valid number.")
-
-    except Exception as e:
-        logger.exception("Echo update failed")
-        await message.reply(f"❌ Error: {e}")
+        await message.reply("❌ Enter a valid whole number.")
 
 
 # ================= .GAIN =================
-@app.on_message(
-    filters.command("gain", prefixes=".") & sudo_filter
-)
+@app.on_message(filters.command("gain", prefixes=".") & sudo_filter)
 async def set_gain(client: Client, message: Message):
     global current_gain
-
     args = (message.text or "").split()
-
     if len(args) < 2:
-        await message.reply(
-            f"🎛 Current distortion: `{current_gain}/500`\n"
-            "Usage: `.gain <0-500>`\n"
-            "Use `.gain 0` to disable added distortion."
-        )
+        await message.reply(f"🎛 Gain: `{current_gain}/2000` | Usage: `.gain <0-2000>`")
         return
-
     try:
         value = int(args[1])
-
-        if not 0 <= value <= 500:
-            await message.reply(
-                "⚠️ Gain must be between 0 and 500."
-            )
+        if not 0 <= value <= 2000:
+            await message.reply("⚠️ Gain must be between 0 and 2000.")
             return
-
         current_gain = value
-
-        if value == 0:
-            await message.reply("🎛 Added distortion disabled.")
-        else:
-            await message.reply(
-                f"🎛 Distortion set to `{current_gain}/500`."
-            )
-
+        await message.reply(f"🎛 Gain updated: `{value}/2000`.")
     except ValueError:
-        await message.reply("❌ Enter a valid number.")
-
-    except Exception as e:
-        logger.exception("Gain update failed")
-        await message.reply(f"❌ Error: {e}")
+        await message.reply("❌ Enter a valid whole number.")
 
 
 # ================= .BASS =================
-@app.on_message(
-    filters.command("bass", prefixes=".") & sudo_filter
-)
+@app.on_message(filters.command("bass", prefixes=".") & sudo_filter)
 async def set_bass(client: Client, message: Message):
-    global current_bass
-    global bass_filter_state
-
+    global current_bass, bass_filter_state
     args = (message.text or "").split()
-
     if len(args) < 2:
-        await message.reply(
-            f"🔊 Current bass: `{current_bass}/300`\n"
-            "Usage: `.bass <0-300>`\n"
-            "Use `.bass 0` to disable bass boost."
-        )
+        await message.reply(f"🔊 Bass: `{current_bass}/1500` | Usage: `.bass <0-1500>`")
         return
-
     try:
         value = int(args[1])
-
-        if not 0 <= value <= 300:
-            await message.reply(
-                "⚠️ Bass must be between 0 and 300."
-            )
+        if not 0 <= value <= 1500:
+            await message.reply("⚠️ Bass must be between 0 and 1500.")
             return
-
         current_bass = value
         bass_filter_state.fill(0)
-
-        if value == 0:
-            await message.reply("🔊 Bass boost disabled.")
-        else:
-            await message.reply(
-                f"🔊 Bass boost set to `{value}/300`."
-            )
-
+        await message.reply(f"🔊 Bass updated: `{value}/1500`.")
     except ValueError:
-        await message.reply("❌ Enter a valid number.")
+        await message.reply("❌ Enter a valid whole number.")
 
-    except Exception as e:
-        logger.exception("Bass update failed")
-        await message.reply(f"❌ Error: {e}")
+
+# ================= .DOUBLE =================
+@app.on_message(filters.command("double", prefixes=".") & sudo_filter)
+async def set_double(client: Client, message: Message):
+    global current_double, double_buffer
+    args = (message.text or "").split()
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        status = "ON" if current_double else "OFF"
+        await message.reply(f"🎙 Double voice: `{status}` | Usage: `.double on` / `.double off`")
+        return
+    current_double = args[1].lower() == "on"
+    double_buffer.fill(0)
+    await message.reply(f"🎙 Double voice {'enabled' if current_double else 'disabled'}.")
 
 
 # ================= .LEAVEVC =================
@@ -683,6 +571,7 @@ async def leave_vc(client: Client, message: Message):
     global current_logger_chat
     global current_target_chat
     global echo_buffer
+    global double_buffer
     global bass_filter_state
 
     async with bridge_lock:
@@ -718,6 +607,7 @@ async def leave_vc(client: Client, message: Message):
         current_logger_chat = None
         current_target_chat = None
         echo_buffer.fill(0)
+        double_buffer.fill(0)
         bass_filter_state.fill(0)
 
         if errors:
