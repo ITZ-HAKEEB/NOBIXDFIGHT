@@ -65,3 +65,30 @@ When deploying to Heroku, make sure to set the following Config Vars:
 ### 💻 Connect With Me
 * **GitHub:** [ITZ-HAKEEB](https://github.com/ITZ-HAKEEB)
 * 
+### 🐳 VPS Deployment Commands (Using Docker)
+
+1. Repository को क्लोन करें और फ़ोल्डर में जाएँ:
+```bash
+git clone https://github.com && cd NOBIXDFIGHT
+```
+
+2. पर्यावरण वेरिएबल्स (Environment Variables) सेट करें:
+```bash
+nano .env
+```
+*(यहाँ अपने ज़रूरी टोकन और क्रेडेंशियल्स लिखकर सेव कर लें)*
+
+3. Docker Image बिल्ड (Build) करें:
+```bash
+docker build -t nobixdfight-bot .
+```
+
+4. Docker Container को बैकग्राउंड (Detached Mode) में रन करें:
+```bash
+docker run -d --name nobixdfight-container --env-file .env nobixdfight-bot
+```
+
+5. Bot के लॉग्स (Logs) चेक करने के लिए:
+```bash
+docker logs -f nobixdfight-container
+```
